@@ -1,0 +1,11 @@
+{
+    "id": "project-tag-mover",
+    "name": "Project Tag Mover",
+    "version": "0.1.0",
+    "minAppVersion": "0.15.0",
+    "description": "Move notes to project folders based on #pjt/ tags on save.",
+    "author": "藤本伊織",
+    "authorUrl": "https://github.com/ioriioriiori",
+    "isDesktopOnly": true
+  }
+  

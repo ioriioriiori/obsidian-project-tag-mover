@@ -1,0 +1,12 @@
+{
+  "tagPrefix": "#pjt/",
+  "rootFolder": "03_project",
+  "notesFolder": "02_notes/",
+  "tagRules": [
+    {
+      "pattern": "work",
+      "destination": "",
+      "tagPattern": ""
+    }
+  ]
+}
