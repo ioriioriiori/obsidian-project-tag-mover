@@ -6,7 +6,8 @@ const {
   parseYaml,
   PluginSettingTab,
   Setting,
-  TFile
+  TFile,
+  normalizePath // Add this
 } = require("obsidian");
 
 /* ---------- デフォルト設定 ---------- */
@@ -103,27 +104,7 @@ class ProjectTagMover extends Plugin {
     }
 
     const relativePath = first.substring(rawPrefix.length);
-    await this.moveFileToProject(file, relativePath);
-  }
-
-  async moveFileToProject(file, relativePath) {
-    const targetPath = `${this.settings.rootFolder}/${relativePath}/${file.name}`;
-    const folderPath = targetPath.substring(0, targetPath.lastIndexOf("/"));
-
-    console.log(`[ProjectTagMover] 移動先: ${targetPath}`);
-    console.log(`[ProjectTagMover] フォルダ作成: ${folderPath}`);
-
-    try {
-      if (!(await this.app.vault.adapter.exists(folderPath))) {
-        await this.app.vault.adapter.mkdir(folderPath);
-      }
-      await this.app.fileManager.renameFile(file, targetPath);
-      new Notice(`Moved to '${targetPath}'`);
-      console.log(`[ProjectTagMover] 移動完了: '${file.path}' → '${targetPath}'`);
-    } catch (e) {
-      console.error("[ProjectTagMover] 移動失敗:", e);
-      new Notice("ファイル移動に失敗しました。");
-    }
+    await this.moveFileToProject(file, relativePath, false);
   }
 
   async moveAllFiles() {
@@ -197,11 +178,20 @@ class ProjectTagMover extends Plugin {
 
     // 3) タグルールに基づいて移動先を決定
     for (const pattern of tags) {
-      const rule = this.settings.tagRules.find(r => r.tagPattern === pattern);
+      // Normalize the scanned 'pattern' from the note by removing any leading '#'
+      const normalizedPattern = pattern.replace(/^#/, "");
+
+      const rule = this.settings.tagRules.find(r =>
+        // Normalize r.tagPattern from settings by removing any leading '#'
+        r.tagPattern.replace(/^#/, "") === normalizedPattern
+      );
       if (rule) {
-        console.log(`[ProjectTagMover] ルールにマッチ: ${pattern} → ${rule.destination}`);
-        await this.moveFileToProject(file, rule.destination, true);
-        return;
+        console.log(`[ProjectTagMover] ルールにマッチ: ${pattern} (normalized to ${normalizedPattern}) → ${rule.destination}`);
+        const moveSuccess = await this.moveFileToProject(file, rule.destination, true);
+        if (!moveSuccess) {
+          throw new Error(`Failed to move file based on rule: ${pattern} → ${rule.destination}`);
+        }
+        return; // Success, exit
       }
     }
 
@@ -211,32 +201,77 @@ class ProjectTagMover extends Plugin {
     if (pjtTag) {
       const relativePath = pjtTag.substring(pjtPrefix.length);
       console.log(`[ProjectTagMover] デフォルト処理: ${pjtTag} → ${relativePath}`);
-      await this.moveFileToProject(file, relativePath, false);
-      return;
+      const moveSuccess = await this.moveFileToProject(file, relativePath, false);
+      if (!moveSuccess) {
+        throw new Error(`Failed to move file based on pjt tag: ${pjtTag}`);
+      }
+      return; // Success, exit
     }
 
-    throw new Error("対応するタグが見つかりません。");
+    throw new Error("対応するタグが見つかりません。"); // No rule or pjt tag matched
   }
 
   async moveFileToProject(file, path, isFullPath) {
-    const targetPath = isFullPath 
-      ? `${path}/${file.name}`
-      : `${this.settings.rootFolder}/${path}/${file.name}`;
+    // Sanitize the input path to prevent traversal
+    const sanitizedPathSegment = normalizePath(path);
+
+    // Prevent empty or purely traversal paths after sanitization
+    if (!sanitizedPathSegment || sanitizedPathSegment === '.' || sanitizedPathSegment.startsWith('..')) {
+      new Notice(`Invalid path specified: ${path}`);
+      console.error(`[ProjectTagMover] Invalid or traversal path detected and blocked: ${path}`);
+      return false; // Indicate failure
+    }
+
+    const baseFolder = isFullPath
+      ? '' // For full paths, the sanitizedPathSegment is from vault root
+      : this.settings.rootFolder;
+
+    // Construct targetPath using the sanitized segment
+    // If isFullPath, sanitizedPathSegment is the full path from vault root (minus filename)
+    // If not isFullPath, it's relative to baseFolder
+    let preliminaryTargetPath;
+    if (isFullPath) {
+      // rule.destination should be a folder path, so we append the file name.
+      preliminaryTargetPath = `${sanitizedPathSegment}/${file.name}`;
+    } else {
+      preliminaryTargetPath = `${baseFolder}/${sanitizedPathSegment}/${file.name}`;
+    }
+
+    // Normalize the ENTIRE path to resolve any '..' etc. introduced by baseFolder or filename
+    const targetPath = normalizePath(preliminaryTargetPath);
+
+    // Additional check: Ensure the target path is not attempting to escape the vault root
+    // (normalizePath should handle this by keeping it relative, but an explicit check is good defense in depth)
+    // This check might be redundant if normalizePath always guarantees paths are relative to vault root and don't start with '..'
+    if (targetPath.startsWith('../')) {
+      new Notice(`Blocked potentially malicious path: ${targetPath}`);
+      console.error(`[ProjectTagMover] Blocked path escaping vault root: ${targetPath}`);
+      return false; // Indicate failure
+    }
+
     const folderPath = targetPath.substring(0, targetPath.lastIndexOf("/"));
 
     console.log(`[ProjectTagMover] 移動先: ${targetPath}`);
     console.log(`[ProjectTagMover] フォルダ作成: ${folderPath}`);
 
     try {
-      if (!(await this.app.vault.adapter.exists(folderPath))) {
+      // Check if folderPath is root before creating
+      if (folderPath && !(await this.app.vault.adapter.exists(folderPath))) {
         await this.app.vault.adapter.mkdir(folderPath);
+      } else if (!folderPath) {
+        // This case means the file is being moved to the vault root.
+        // Depending on desired behavior, this might be okay or might warrant a warning/block.
+        // For now, allow it, assuming normalizePath has made it safe.
+        console.log(`[ProjectTagMover] Target folder is vault root for path: ${targetPath}`);
       }
       await this.app.fileManager.renameFile(file, targetPath);
       new Notice(`Moved to '${targetPath}'`);
       console.log(`[ProjectTagMover] 移動完了: '${file.path}' → '${targetPath}'`);
+      return true; // Indicate success
     } catch (e) {
       console.error("[ProjectTagMover] 移動失敗:", e);
       new Notice("ファイル移動に失敗しました。");
+      return false; // Indicate failure
     }
   }
 
@@ -246,28 +281,6 @@ class ProjectTagMover extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    await this.loadTagRules();
-  }
-
-  async loadTagRules() {
-    try {
-      const rulesFile = this.app.vault.getAbstractFileByPath(this.settings.tagRulesFile);
-      if (rulesFile && rulesFile instanceof TFile) {
-        const content = await this.app.vault.read(rulesFile);
-        // タグルールの解析処理をここに追加
-        // 例: YAML形式で記述されたルールを解析
-        try {
-          const rules = parseYaml(content);
-          this.tagRules = rules;
-        } catch (e) {
-          console.error("タグルールの解析に失敗:", e);
-          this.tagRules = {};
-        }
-      }
-    } catch (e) {
-      console.error("タグルールファイルの読み込みに失敗:", e);
-      this.tagRules = {};
-    }
   }
 
   async saveSettings() {
@@ -296,8 +309,13 @@ class ProjectTagMoverSettingTab extends PluginSettingTab {
           .setPlaceholder("#pjt/")
           .setValue(this.plugin.settings.tagPrefix)
           .onChange(async value => {
-            this.plugin.settings.tagPrefix = value.trim();
-            await this.plugin.saveSettings();
+            try {
+              this.plugin.settings.tagPrefix = value.trim();
+              await this.plugin.saveSettings();
+            } catch (e) {
+              console.error("Failed to save Project Tag Mover settings (tagPrefix):", e);
+              new Notice("Failed to save settings. Please check the console for details.");
+            }
           })
       );
 
@@ -309,8 +327,13 @@ class ProjectTagMoverSettingTab extends PluginSettingTab {
           .setPlaceholder("03_project")
           .setValue(this.plugin.settings.rootFolder)
           .onChange(async value => {
-            this.plugin.settings.rootFolder = value.trim();
-            await this.plugin.saveSettings();
+            try {
+              this.plugin.settings.rootFolder = value.trim();
+              await this.plugin.saveSettings();
+            } catch (e) {
+              console.error("Failed to save Project Tag Mover settings (rootFolder):", e);
+              new Notice("Failed to save settings. Please check the console for details.");
+            }
           })
       );
 
@@ -322,8 +345,13 @@ class ProjectTagMoverSettingTab extends PluginSettingTab {
           .setPlaceholder("02/notes")
           .setValue(this.plugin.settings.notesFolder)
           .onChange(async value => {
-            this.plugin.settings.notesFolder = value.trim();
-            await this.plugin.saveSettings();
+            try {
+              this.plugin.settings.notesFolder = value.trim();
+              await this.plugin.saveSettings();
+            } catch (e) {
+              console.error("Failed to save Project Tag Mover settings (notesFolder):", e);
+              new Notice("Failed to save settings. Please check the console for details.");
+            }
           })
       );
 
@@ -351,8 +379,18 @@ class ProjectTagMoverSettingTab extends PluginSettingTab {
               tagPattern: "",
               destination: ""
             });
-            await this.plugin.saveSettings();
+            await this.plugin.saveSettings(); // This one re-renders, so error handling might be different or less critical if display() fails after it.
+            // For now, let's assume saveSettings is the primary point of failure.
+            // If saveSettings fails, display() won't be called with potentially unsaved data.
+          } catch (e) {
+            console.error("Failed to save Project Tag Mover settings (add new rule):", e);
+            new Notice("Failed to save settings when adding a new rule. Please check the console.");
+          } finally {
+            // Ensure display is called to refresh the UI even if save fails,
+            // though the new (unsaved) rule might disappear or an old state might be shown.
+            // Alternatively, only call display on success. For now, always call.
             this.display();
+          }
           });
       });
   }
@@ -364,11 +402,21 @@ class ProjectTagMoverSettingTab extends PluginSettingTab {
       .setName(`ルール ${index + 1}`)
       .addText(text => {
         text
-          .setPlaceholder("タグ名（例: work/urgent または #work/urgent）")
+          // Old: .setPlaceholder("タグ名（例: work/urgent または #work/urgent）")
+          .setPlaceholder("タグ名 (例: work/urgent)") // New placeholder
           .setValue(rule.tagPattern)
           .onChange(async value => {
-            this.plugin.settings.tagRules[index].tagPattern = value.trim();
-            await this.plugin.saveSettings();
+            try {
+              // Optional: you could also normalize here before saving, e.g.
+              // this.plugin.settings.tagRules[index].tagPattern = value.trim().replace(/^#/, "");
+              // However, with the matching logic change, it's not strictly necessary for functionality.
+              // For consistency, let's trim and remove leading # when saving.
+              this.plugin.settings.tagRules[index].tagPattern = value.trim().replace(/^#/, "");
+              await this.plugin.saveSettings();
+            } catch (e) {
+              console.error("Failed to save Project Tag Mover settings (tagPattern for a rule):", e);
+              new Notice("Failed to save settings for a rule. Please check the console.");
+            }
           });
       })
       .addText(text => {
@@ -376,17 +424,29 @@ class ProjectTagMoverSettingTab extends PluginSettingTab {
           .setPlaceholder("移動先フォルダ（例: 01_inbox/urgent）")
           .setValue(rule.destination)
           .onChange(async value => {
-            this.plugin.settings.tagRules[index].destination = value.trim();
-            await this.plugin.saveSettings();
+            try {
+              this.plugin.settings.tagRules[index].destination = value.trim();
+              await this.plugin.saveSettings();
+            } catch (e) {
+              console.error("Failed to save Project Tag Mover settings (destination for a rule):", e);
+              new Notice("Failed to save settings for a rule. Please check the console.");
+            }
           });
       })
       .addButton(button => {
         button
           .setButtonText("削除")
           .onClick(async () => {
-            this.plugin.settings.tagRules.splice(index, 1);
-            await this.plugin.saveSettings();
-            this.display();
+            try {
+              this.plugin.settings.tagRules.splice(index, 1);
+              await this.plugin.saveSettings();
+            } catch (e) {
+              console.error("Failed to save Project Tag Mover settings (delete rule):", e);
+              new Notice("Failed to save settings when deleting a rule. Please check the console.");
+            } finally {
+              // Ensure display is called to refresh the UI
+              this.display();
+            }
           });
       });
   }
